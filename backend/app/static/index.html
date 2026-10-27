@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repo Steward</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --mute:#667085; --line:#d9dde3; --accent:#2f5bea; --ok:#1a7f4b; --bad:#b42318; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171c; --card:#1d2128; --ink:#e7e9ee; --mute:#9aa3b2; --line:#2f353f; --accent:#7b9bff; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:12px; padding:12px; height:calc(100vh - 54px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height:auto; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; display:flex; flex-direction:column; min-height:0; }
+  section > h2 { font-size:13px; margin:0; padding:8px 12px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+  .body { padding:12px; overflow:auto; flex:1; min-height:200px; }
+  .msg { white-space:pre-wrap; margin:0 0 10px; padding:8px 10px; border-radius:6px; background:var(--bg); }
+  .msg.user { background:color-mix(in srgb, var(--accent) 14%, transparent); }
+  form { display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); }
+  input, textarea, button { font:inherit; color:inherit; }
+  input, textarea { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  textarea { flex:1; resize:vertical; min-height:38px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button.bad { background:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  .change { border:1px solid var(--line); border-radius:6px; margin-bottom:10px; overflow:hidden; }
+  .change > .head { display:flex; gap:8px; align-items:center; padding:6px 10px; background:var(--bg); flex-wrap:wrap; }
+  .change .path { font-family:ui-monospace, monospace; flex:1; word-break:break-all; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); }
+  .badge.failed { color:var(--bad); border-color:var(--bad); }
+  .badge.applied_unindexed { color:var(--warn); border-color:var(--warn); }
+  .badge.pending { color:var(--accent); border-color:var(--accent); }
+  pre { margin:0; font:12px/1.4 ui-monospace, monospace; overflow:auto; }
+  .diff { padding:6px 0; max-height:260px; }
+  .diff div { padding:0 10px; white-space:pre; }
+  .diff .add { background:color-mix(in srgb, var(--ok) 18%, transparent); }
+  .diff .del { background:color-mix(in srgb, var(--bad) 18%, transparent); }
+  .diff .hunk { color:var(--mute); }
+  .actions { display:flex; gap:8px; padding:8px 10px; border-top:1px solid var(--line); }
+  .err { color:var(--bad); padding:4px 10px 8px; }
+  .muted { color:var(--mute); }
+  .file { display:block; width:100%; text-align:left; background:none; color:var(--ink); padding:2px 4px; font-family:ui-monospace, monospace; font-size:12px; border-radius:4px; }
+  .file:hover { background:var(--bg); }
+  #viewer { border-top:1px solid var(--line); padding:8px 12px; max-height:40%; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Repo Steward</h1>
+  <label class="muted">Admin key <input id="key" type="password" autocomplete="off" placeholder="kept in memory only"></label>
+</header>
+<main>
+  <section id="chat">
+    <h2>Chat</h2>
+    <div class="body" id="log"></div>
+    <form id="chatForm">
+      <textarea id="msg" placeholder="Ask about the repo or request a change…" required></textarea>
+      <button id="send">Send</button>
+    </form>
+  </section>
+  <div style="display:grid; grid-template-rows: 1fr 1fr; gap:12px; min-height:0;">
+    <section>
+      <h2>Changes <button class="secondary" id="refresh">Refresh</button></h2>
+      <div class="body" id="changes"><span class="muted">Enter the admin key, then refresh.</span></div>
+    </section>
+    <section>
+      <h2>Sandbox files <button class="secondary" id="reload">Reload</button></h2>
+      <div class="body" id="files"></div>
+      <div id="viewer" hidden><pre id="fileContent"></pre></div>
+    </section>
+  </div>
+</main>
+<script>
+  // Everything from the server is rendered with textContent: diffs and replies contain agent-written text.
+  const $ = (id) => document.getElementById(id);
+  const sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+
+  async function api(path, opts = {}) {
+    const key = $("key").value;
+    if (!key) throw new Error("Enter the admin key first");
+    const res = await fetch(path, { ...opts, headers: { "X-Admin-Key": key, "Content-Type": "application/json" } });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+    return data;
+  }
+
+  function addMsg(text, who) { $("log").appendChild(el("div", "msg " + who, text)); $("log").scrollTop = 1e9; }
+
+  $("chatForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = $("msg").value.trim();
+    if (!message) return;
+    $("msg").value = ""; addMsg(message, "user"); $("send").disabled = true;
+    try {
+      const out = await api("/chat", { method: "POST", body: JSON.stringify({ message, session_id: sessionId }) });
+      addMsg(out.reply, "agent");
+      loadChanges();
+    } catch (err) { addMsg("Error: " + err.message, "agent"); }
+    $("send").disabled = false;
+  });
+
+  function renderDiff(diff) {
+    const box = el("pre", "diff");
+    for (const line of diff.split("\n")) {
+      const cls = line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "";
+      box.appendChild(el("div", cls, line || " "));
+    }
+    return box;
+  }
+
+  async function decide(id, action) {
+    try { await api(`/${action}/${id}`, { method: "POST" }); } catch (err) { alert(err.message); }
+    loadChanges(); loadFiles();
+  }
+
+  async function loadChanges() {
+    const box = $("changes");
+    try {
+      const all = await api("/changes?status=all");
+      const shown = all.filter((c) => ["pending", "failed", "applied_unindexed"].includes(c.status));
+      box.replaceChildren();
+      if (!shown.length) box.appendChild(el("span", "muted", "No pending or problem changes."));
+      for (const c of shown) {
+        const card = el("div", "change");
+        const head = el("div", "head");
+        head.append(el("strong", "", "#" + c.id), el("span", "badge", c.type), el("span", "path", c.path), el("span", "badge " + c.status, c.status));
+        card.appendChild(head);
+        if (c.diff) card.appendChild(renderDiff(c.diff));
+        if (c.error) card.appendChild(el("div", "err", c.error));
+        if (c.status === "pending") {
+          const act = el("div", "actions");
+          const ok = el("button", "", "Approve"), no = el("button", "bad", "Reject");
+          ok.onclick = () => decide(c.id, "approve"); no.onclick = () => decide(c.id, "reject");
+          act.append(ok, no); card.appendChild(act);
+        }
+        box.appendChild(card);
+      }
+    } catch (err) { box.replaceChildren(el("span", "err", err.message)); }
+  }
+
+  async function loadFiles() {
+    const box = $("files");
+    try {
+      const { files } = await api("/files/tree");
+      box.replaceChildren();
+      for (const f of files) {
+        const b = el("button", "file", f);
+        b.onclick = async () => {
+          try { const r = await api("/files/read?path=" + encodeURIComponent(f)); $("fileContent").textContent = r.content; $("viewer").hidden = false; }
+          catch (err) { $("fileContent").textContent = err.message; $("viewer").hidden = false; }
+        };
+        box.appendChild(b);
+      }
+      if (!files.length) box.appendChild(el("span", "muted", "Sandbox is empty."));
+    } catch (err) { box.replaceChildren(el("span", "err", err.message)); }
+  }
+
+  $("refresh").onclick = loadChanges;
+  $("reload").onclick = loadFiles;
+  $("key").addEventListener("change", () => { loadChanges(); loadFiles(); });
+</script>
+</body>
+</html>
